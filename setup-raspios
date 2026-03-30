@@ -121,14 +121,20 @@ def resolve_ssh_keys(user):
     if key_contents:
         user["ssh_authorized_keys"] = key_contents
 
-def resolve_files(files):
+def resolve_files(files, config_dir=None):
     """
     Read file contents from src paths and return list of
     {dst, mode, content} dicts for the Docker task.
+    Relative paths are resolved relative to the config file's directory,
+    or the current working directory if no config file was used.
     """
+    base = config_dir or os.getcwd()
     resolved = []
     for entry in files:
         src = os.path.expanduser(entry["src"])
+        if not os.path.isabs(src):
+            src = os.path.join(base, src)
+        src = os.path.abspath(src)
         if not os.path.isfile(src):
             print(f"Warning: file not found, skipping: {src}")
             continue
@@ -211,7 +217,8 @@ def run_tasks(mountpoint, cfg):
         config = {k: v for k, v in config.items() if k not in wifi_detail_keys or k in explicit}
 
     # Resolve file contents before passing to Docker
-    resolved_files = resolve_files(cfg.get("files", []))
+    config_dir = os.path.dirname(os.path.abspath(args.config)) if args.config else None
+    resolved_files = resolve_files(cfg.get("files", []), config_dir=config_dir)
 
     tasks = {
         "packages": cfg.get("packages", []),
