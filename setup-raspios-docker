@@ -46,11 +46,9 @@ def chroot_run(cmd, stdin=None):
         sys.exit(result.returncode)
 
 def netmask_to_prefix(netmask):
-    """Convert e.g. '255.255.255.0' -> 24"""
     return sum(bin(int(x)).count('1') for x in netmask.split('.'))
 
 def nm_eth_connection(cfg):
-    """NetworkManager keyfile for eth0."""
     if cfg.get("eth_dhcp", True):
         ipv4 = "method=auto"
     else:
@@ -72,7 +70,6 @@ method=auto
 """
 
 def nm_wifi_connection(cfg):
-    """NetworkManager keyfile for wlan0."""
     if not cfg.get("wifi"):
         return None
     if cfg.get("wifi_dhcp", True):
@@ -117,8 +114,6 @@ ff02::2     ip6-allrouters
         write(f"{nm_dir}/wlan0.nmconnection", wifi, mode=0o600)
 
     if cfg.get("persistent_logging"):
-        # Write a drop-in to override Pi OS's volatile storage default
-        # (/usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf)
         dropin = f"{r}/etc/systemd/journald.conf.d/99-persistent.conf"
         print(f"  enabling persistent logging via {dropin}")
         os.makedirs(os.path.dirname(dropin), exist_ok=True)
@@ -171,15 +166,20 @@ def write_first_boot(cmd):
     chroot_run("systemctl enable first-boot")
 
 
+def copy_files(files):
+    for entry in files:
+        dst  = ROOT + entry["dst"]
+        mode = int(entry.get("mode", "0644"), 8)
+        write(dst, entry["content"], mode=mode)
+
+
 def write_ssh_keys(name, keys):
-    """Write authorized_keys for a user with correct ownership and permissions."""
-    ssh_dir  = f"{ROOT}/home/{name}/.ssh"
+    ssh_dir   = f"{ROOT}/home/{name}/.ssh"
     auth_file = f"{ssh_dir}/authorized_keys"
     os.makedirs(ssh_dir, exist_ok=True)
     with open(auth_file, 'w') as f:
         for key in keys:
             f.write(key.strip() + "\n")
-    # Look up uid/gid from the chroot passwd file
     uid, gid = None, None
     passwd = f"{ROOT}/etc/passwd"
     if os.path.exists(passwd):
@@ -200,6 +200,7 @@ def main():
     tasks    = json.loads(raw)
     packages = tasks.get("packages", [])
     users    = tasks.get("users", [])
+    files    = tasks.get("files", [])
     cfg      = tasks.get("config", {})
 
     safe = dict(tasks)
@@ -209,6 +210,10 @@ def main():
 
     print("\n=== Writing config files ===", flush=True)
     write_configs(cfg)
+
+    if files:
+        print(f"\n=== Copying {len(files)} file(s) into image ===", flush=True)
+        copy_files(files)
 
     setup_qemu()
     try:

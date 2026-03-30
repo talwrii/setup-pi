@@ -8,8 +8,8 @@ I got bored with mounting and settng up a device to get networking via rj-45 wor
 
 Part of my motivation was a particularly nasty issue where the Pi would die immeidatley ater boot producing no logs with a certain wifi adaptor. The response from r/raspberrypi on reddit was of course "this is off topic and documented", it was not oftopic or documented.
 
-
 ## Alternatives and prior work
+Raspios 
 
 
 ## Installation
