@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""
+setup-sd-docker - Entrypoint for pi-setup Docker image.
+Reads a JSON task list from stdin and runs chroot commands against /mnt/pi.
+Uses capsh to chroot and drop CAP_SYS_CHROOT before executing any commands.
+"""
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+
+os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
+
+QEMU_SRC = "/usr/bin/qemu-arm-static"
+QEMU_DST = "/mnt/pi/usr/bin/qemu-arm-static"
+ROOT     = "/mnt/pi"
+
+def write(path, content, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write(content)
+    os.chmod(path, mode)
+    print(f"  wrote {path}")
+
+def setup_qemu():
+    os.makedirs(os.path.dirname(QEMU_DST), exist_ok=True)
+    shutil.copy2(QEMU_SRC, QEMU_DST)
+    print(f"  copied qemu -> {QEMU_DST}", flush=True)
+
+def teardown_qemu():
+    try:
+        os.unlink(QEMU_DST)
+        print(f"  removed {QEMU_DST}", flush=True)
+    except FileNotFoundError:
+        pass
+
+def chroot_run(cmd, stdin=None):
+    full = f"capsh --drop=cap_sys_chroot,cap_mknod --chroot={ROOT} -- -c {shlex.quote(cmd)}"
+    print(f"  $ {full}", flush=True)
+    result = subprocess.run(full, shell=True, input=stdin, text=True)
+    if result.returncode != 0:
+        print(f"  ! failed with exit code {result.returncode}", file=sys.stderr, flush=True)
+        teardown_qemu()
+        sys.exit(result.returncode)
+
+def eth0_block(cfg):
+    if cfg.get("eth_dhcp", True):
+        return """\
+auto eth0
+allow-hotplug eth0
+iface eth0 inet dhcp
+"""
+    else:
+        lines = [
+            "auto eth0",
+            "allow-hotplug eth0",
+            "iface eth0 inet static",
+            f"    address {cfg['eth_ip']}",
+            f"    netmask {cfg['eth_netmask']}",
+        ]
+        if cfg.get("eth_gateway"):
+            lines.append(f"    gateway {cfg['eth_gateway']}")
+        return "\n".join(lines) + "\n"
+
+def wlan0_block(cfg):
+    if not cfg.get("wifi"):
+        return ""
+    if cfg.get("wifi_dhcp", True):
+        return """\
+auto wlan0
+allow-hotplug wlan0
+iface wlan0 inet dhcp
+    wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf
+"""
+    else:
+        return f"""\
+auto wlan0
+allow-hotplug wlan0
+iface wlan0 inet static
+    address {cfg["wlan0_ip"]}
+    netmask {cfg["wifi_netmask"]}
+    gateway {cfg["wifi_gateway"]}
+    wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf
+"""
+
+def write_configs(cfg):
+    r = ROOT
+    write(f"{r}/etc/hostname", cfg["hostname"] + "\n")
+    write(f"{r}/etc/hosts", f"""\
+127.0.0.1   localhost
+127.0.1.1   {cfg["hostname"]}
+::1         localhost ip6-localhost ip6-loopback
+ff02::1     ip6-allnodes
+ff02::2     ip6-allrouters
+""")
+    write(f"{r}/etc/network/interfaces", f"""\
+source /etc/network/interfaces.d/*
+auto lo
+iface lo inet loopback
+{eth0_block(cfg)}
+{wlan0_block(cfg)}""")
+    if cfg.get("wifi"):
+        write(f"{r}/etc/wpa_supplicant/wpa_supplicant.conf", f"""\
+ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
+update_config=1
+mac_addr=0
+network={{
+    ssid="{cfg["wifi_ssid"]}"
+    psk="{cfg["wifi_pass"]}"
+}}
+""", mode=0o600)
+
+def main():
+    raw      = sys.stdin.read()
+    tasks    = json.loads(raw)
+    packages = tasks.get("packages", [])
+    users    = tasks.get("users", [])
+    cfg      = tasks.get("config", {})
+
+    safe = dict(tasks)
+    safe["users"] = [{**u, "password": "***"} for u in users]
+    print(f"Tasks: {json.dumps(safe)}", flush=True)
+
+    print("\n=== Writing config files ===", flush=True)
+    write_configs(cfg)
+
+    setup_qemu()
+
+    try:
+        if packages:
+            print(f"\n=== Installing packages: {' '.join(packages)} ===", flush=True)
+            chroot_run("apt-get update")
+            chroot_run(f"DEBIAN_FRONTEND=noninteractive apt-get install -y {' '.join(packages)}")
+
+        for user in users:
+            name     = user["name"]
+            password = user["password"]
+            sudo     = user.get("sudo", False)
+            print(f"\n=== Creating user: {name} (sudo={sudo}) ===", flush=True)
+            chroot_run(f"useradd -m -s /bin/bash {name}")
+            chroot_run("chpasswd", stdin=f"{name}:{password}\n")
+            if sudo:
+                chroot_run(f"usermod -aG sudo {name}")
+    finally:
+        teardown_qemu()
+
+    print("\n=== Done ===", flush=True)
+
+if __name__ == "__main__":
+    main()

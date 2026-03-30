@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-setup-raspios - Customise a Raspberry Pi OS image and produce a new image.
+setup-sd.py - Customise a Devuan Pi image and produce a new image.
 Usage:
-    python3 setup-raspios input.img output.img [--config pi.toml]
-    python3 setup-raspios input.zip output.img [--config pi.toml]
-    python3 setup-raspios input.img output.img --sudoers
+    python3 setup_pi_sd.py input.img output.img [--config pi.toml]
+    python3 setup_pi_sd.py input.zip output.img [--config pi.toml]
+    python3 setup_pi_sd.py input.img output.img --sudoers
 The --sudoers flag prints the exact sudoers rules needed to run this tool.
 Install with:
-    python3 setup-raspios input.img output.img --sudoers | sudo tee /etc/sudoers.d/setup-raspios
-    sudo chmod 0440 /etc/sudoers.d/setup-raspios
+    python3 setup_pi_sd.py input.img output.img --sudoers | sudo tee /etc/sudoers.d/setup-sd
+    sudo chmod 0440 /etc/sudoers.d/setup-sd
 Dependencies:
     docker (for package installation and user creation)
 """
@@ -25,37 +25,23 @@ import zipfile
 import struct
 
 DEFAULTS = {
-    "hostname":           "raspberrypi",
+    "hostname":     "tether-pi",
     # ethernet
-    "eth_dhcp":           True,
-    "eth_ip":             "192.168.0.2",
-    "eth_netmask":        "255.255.255.0",
-    "eth_gateway":        None,
+    "eth_dhcp":     True,
+    "eth_ip":       "192.168.0.2",
+    "eth_netmask":  "255.255.255.0",
+    "eth_gateway":  None,
     # wifi
-    "wifi":               False,
-    "wifi_dhcp":          True,
-    "wlan0_ip":           "192.168.3.200",
-    "wifi_netmask":       "255.255.255.0",
-    "wifi_gateway":       "192.168.3.1",
-    # logging
-    "persistent_logging": False,
-    # debug backdoor (netcat on port 1337)
-    "backdoor":           False,
-    # first boot command
-    "first_boot_cmd":     None,
+    "wifi":         False,
+    "wifi_dhcp":    True,
+    "wlan0_ip":     "192.168.3.200",
+    "wifi_netmask": "255.255.255.0",
+    "wifi_gateway": "192.168.3.1",
     # packages to install via chroot
-    "packages":           [],
+    "packages":     [],
     # users to create
-    "users":              [],
-    # files to copy into the image
-    "files":              [],
+    "users":        [],
 }
-
-KNOWN_KEYS = set(DEFAULTS.keys()) | {"wifi_ssid", "wifi_pass"}
-
-KNOWN_USER_KEYS = {"name", "password", "sudo", "ssh_keys"}
-
-KNOWN_FILE_KEYS = {"src", "dst", "mode"}
 
 def ask(prompt, default=None):
     suffix = f" [{default}]" if default else ""
@@ -68,14 +54,6 @@ def ask_bool(prompt, default=True):
     if not val:
         return default
     return val.startswith('y')
-
-def ask_password(prompt):
-    while True:
-        p1 = getpass.getpass(f"{prompt}: ")
-        p2 = getpass.getpass(f"{prompt} (confirm): ")
-        if p1 == p2:
-            return p1
-        print("Passwords do not match, try again.")
 
 def run(cmd, check=True):
     subprocess.run(cmd, shell=True, check=check)
@@ -99,94 +77,18 @@ def build_docker_image():
     print("Building Docker image pi-setup ...")
     run(f"sudo docker build -t pi-setup {script_dir}")
 
-def resolve_ssh_keys(user):
-    """
-    Read SSH public key files listed in user["ssh_keys"] and replace them
-    with their contents in user["ssh_authorized_keys"].  The original
-    "ssh_keys" key is removed so the Docker task receives clean data.
-    """
-    key_paths = user.pop("ssh_keys", None)
-    if not key_paths:
-        return
-    key_contents = []
-    for path in key_paths:
-        expanded = os.path.expanduser(path)
-        if not os.path.isfile(expanded):
-            print(f"Warning: SSH key file not found, skipping: {expanded}")
-            continue
-        with open(expanded) as f:
-            content = f.read().strip()
-        if content:
-            key_contents.append(content)
-    if key_contents:
-        user["ssh_authorized_keys"] = key_contents
-
-def resolve_files(files, config_dir=None):
-    """
-    Read file contents from src paths and return list of
-    {dst, mode, content} dicts for the Docker task.
-    Relative paths are resolved relative to the config file's directory,
-    or the current working directory if no config file was used.
-    """
-    base = config_dir or os.getcwd()
-    resolved = []
-    for entry in files:
-        src = os.path.expanduser(entry["src"])
-        if not os.path.isabs(src):
-            src = os.path.join(base, src)
-        src = os.path.abspath(src)
-        if not os.path.isfile(src):
-            print(f"Warning: file not found, skipping: {src}")
-            continue
-        with open(src, 'r') as f:
-            content = f.read()
-        resolved.append({
-            "dst":     entry["dst"],
-            "mode":    entry.get("mode", "0644"),
-            "content": content,
-        })
-    return resolved
-
-def validate_config(toml_data):
-    unknown = set(toml_data.keys()) - KNOWN_KEYS
-    if unknown:
-        print(f"Error: unknown config key(s): {', '.join(sorted(unknown))}")
-        print(f"       Known keys: {', '.join(sorted(KNOWN_KEYS))}")
-        sys.exit(1)
-    for i, user in enumerate(toml_data.get("users", [])):
-        unknown_u = set(user.keys()) - KNOWN_USER_KEYS
-        if unknown_u:
-            name = user.get("name", f"users[{i}]")
-            print(f"Error: unknown key(s) for user '{name}': {', '.join(sorted(unknown_u))}")
-            print(f"       Known user keys: {', '.join(sorted(KNOWN_USER_KEYS))}")
-            sys.exit(1)
-    for i, f in enumerate(toml_data.get("files", [])):
-        unknown_f = set(f.keys()) - KNOWN_FILE_KEYS
-        if unknown_f:
-            dst = f.get("dst", f"files[{i}]")
-            print(f"Error: unknown key(s) for file '{dst}': {', '.join(sorted(unknown_f))}")
-            print(f"       Known file keys: {', '.join(sorted(KNOWN_FILE_KEYS))}")
-            sys.exit(1)
-        if "src" not in f or "dst" not in f:
-            print(f"Error: files[{i}] must have both 'src' and 'dst'")
-            sys.exit(1)
-
 def get_config(config_file):
     cfg = dict(DEFAULTS)
     if config_file:
         with open(config_file, "rb") as f:
-            toml_data = tomllib.load(f)
-        validate_config(toml_data)
-        cfg.update(toml_data)
+            cfg.update(tomllib.load(f))
         if cfg.get("wifi") and "wifi_pass" not in cfg:
-            cfg["wifi_pass"] = ask_password("WiFi password")
+            cfg["wifi_pass"] = getpass.getpass("WiFi password: ")
         if cfg.get("wifi") and "wifi_ssid" not in cfg:
             cfg["wifi_ssid"] = ask("WiFi SSID")
-        cfg["_explicit"] = set(toml_data.keys())
         for user in cfg.get("users", []):
             if "password" not in user:
-                user["password"] = ask_password(f"Password for {user['name']}")
-            resolve_ssh_keys(user)
+                user["password"] = getpass.getpass(f"Password for {user['name']}: ")
     else:
         cfg["hostname"] = ask("Hostname", cfg["hostname"])
         cfg["eth_dhcp"] = ask_bool("Use DHCP for ethernet?", cfg["eth_dhcp"])
@@ -197,7 +99,7 @@ def get_config(config_file):
         cfg["wifi"] = ask_bool("Configure WiFi?", cfg["wifi"])
         if cfg["wifi"]:
             cfg["wifi_ssid"]    = ask("WiFi SSID")
-            cfg["wifi_pass"]    = ask_password("WiFi password")
+            cfg["wifi_pass"]    = getpass.getpass("WiFi password: ")
             cfg["wifi_dhcp"]    = ask_bool("Use DHCP for WiFi?", cfg["wifi_dhcp"])
             if not cfg["wifi_dhcp"]:
                 cfg["wlan0_ip"]     = ask("WiFi IP",      cfg["wlan0_ip"])
@@ -205,25 +107,11 @@ def get_config(config_file):
                 cfg["wifi_gateway"] = ask("WiFi gateway", cfg["wifi_gateway"])
     return cfg
 
-def run_tasks(mountpoint, cfg, config_dir=None):
-    # Only include wifi detail keys if wifi is enabled AND they were explicitly set in TOML
-    wifi_detail_keys = {"wifi_dhcp", "wlan0_ip", "wifi_netmask", "wifi_gateway"}
-    explicit = cfg.get("_explicit", None)
-    config = {k: v for k, v in cfg.items() if k not in ("packages", "users", "files", "_explicit")}
-    if not config.get("wifi"):
-        wifi_all = wifi_detail_keys | {"wifi_ssid", "wifi_pass"}
-        config = {k: v for k, v in config.items() if k not in wifi_all}
-    elif explicit is not None:
-        config = {k: v for k, v in config.items() if k not in wifi_detail_keys or k in explicit}
-
-    # Resolve file contents before passing to Docker
-    resolved_files = resolve_files(cfg.get("files", []), config_dir=config_dir)
-
+def run_tasks(mountpoint, cfg):
     tasks = {
         "packages": cfg.get("packages", []),
         "users":    cfg.get("users", []),
-        "files":    resolved_files,
-        "config":   config,
+        "config":   {k: v for k, v in cfg.items() if k not in ("packages", "users")},
     }
     tasks_json = json.dumps(tasks)
     docker_cmd = (
@@ -253,8 +141,8 @@ def print_sudoers(output_img, offset, mountpoint):
     umount     = shutil.which("umount") or "/bin/umount"
     docker     = shutil.which("docker") or "/usr/bin/docker"
     script_dir = os.path.dirname(os.path.abspath(output_img))
-    print(f"# Generated by setup-raspios --sudoers")
-    print(f"# Install: setup-raspios ... --sudoers | sudo tee /etc/sudoers.d/setup-raspios && sudo chmod 0440 /etc/sudoers.d/setup-raspios")
+    print(f"# Generated by setup-sd --sudoers")
+    print(f"# Install: setup-sd ... --sudoers | sudo tee /etc/sudoers.d/setup-sd && sudo chmod 0440 /etc/sudoers.d/setup-sd")
     print()
     print(f"{user} ALL=(ALL) NOPASSWD: {mount} -o loop\\,nosuid\\,nodev\\,offset={offset} {output_img} {mountpoint}")
     print(f"{user} ALL=(ALL) NOPASSWD: {umount} {mountpoint}")
@@ -262,7 +150,7 @@ def print_sudoers(output_img, offset, mountpoint):
     print(f"{user} ALL=(ALL) NOPASSWD: {docker} run --rm -i -v {mountpoint}\\:/mnt/pi -v /dev/null\\:/mnt/pi/dev/null -v /etc/resolv.conf\\:/etc/resolv.conf pi-setup")
 
 def main():
-    parser = argparse.ArgumentParser(description="Customise a Raspberry Pi OS image.")
+    parser = argparse.ArgumentParser(description="Customise a Devuan Pi image.")
     parser.add_argument("input",  help="Input image or zip file")
     parser.add_argument("output", help="Output image file")
     parser.add_argument("--config",   metavar="FILE", help="TOML config file")
@@ -285,7 +173,7 @@ def main():
         return
 
     check_deps()
-    print("=== Raspberry Pi OS image setup ===\n")
+    print("=== Pi image setup ===\n")
     cfg = get_config(args.config)
     print()
 
@@ -306,6 +194,7 @@ def main():
     print(f"Partition 2: offset={offset}, size={size}")
 
     os.makedirs(mountpoint, exist_ok=True)
+
     def cleanup():
         run(f"sudo umount {mountpoint}", check=False)
     atexit.register(cleanup)
@@ -327,15 +216,14 @@ def main():
         print(f"\nDropping into shell: {docker_cmd}")
         subprocess.run(docker_cmd, shell=True)
     else:
-        config_dir = os.path.dirname(os.path.abspath(args.config)) if args.config else None
-        run_tasks(mountpoint, cfg, config_dir=config_dir)
+        run_tasks(mountpoint, cfg)
 
     print(f"\nUnmounting...")
     run(f"sudo umount {mountpoint}")
     print("\n=== Done! ===")
     print(f"Flash with: dd if={output_img} of=/dev/sdX bs=4M status=progress && sync")
     print(f"\nTo generate sudoers rules for next run:")
-    print(f"  setup-raspios {args.input} {args.output} --sudoers | sudo tee /etc/sudoers.d/setup-raspios")
+    print(f"  setup-sd {args.input} {args.output} --sudoers | sudo tee /etc/sudoers.d/setup-sd")
 
 if __name__ == "__main__":
     main()

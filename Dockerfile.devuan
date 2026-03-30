@@ -1,0 +1,12 @@
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y \
+    proot \
+    qemu-user-static \
+    python3 \
+    strace \
+    iputils-ping \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY setup-sd-docker /usr/local/bin/setup-sd-docker
+RUN chmod +x /usr/local/bin/setup-sd-docker
+ENTRYPOINT ["/usr/local/bin/setup-devuan-docker"]

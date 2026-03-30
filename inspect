@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""
+setup_pi_sd.py - Customise a Devuan Pi image and produce a new image.
+
+Usage:
+    python3 setup_pi_sd.py input.img output.img [--config pi.toml]
+    python3 setup_pi_sd.py input.zip output.img [--config pi.toml]
+
+Dependencies:
+    sudo apt install fuse2fs proot qemu-user-static
+"""
+
+import os
+import sys
+import getpass
+import subprocess
+import tempfile
+import atexit
+import argparse
+import tomllib
+import shutil
+import zipfile
+import struct
+
+DEFAULTS = {
+    "hostname":     "tether-pi",
+    # ethernet
+    "eth_dhcp":     True,
+    "eth_ip":       "192.168.0.2",
+    "eth_netmask":  "255.255.255.0",
+    "eth_gateway":  None,
+    # wifi
+    "wifi":         False,
+    "wifi_dhcp":    True,
+    "wlan0_ip":     "192.168.3.200",
+    "wifi_netmask": "255.255.255.0",
+    "wifi_gateway": "192.168.3.1",
+    # packages to install via proot
+    "packages":     [],
+    # users to create
+    "users":        [],
+}
+
+def ask(prompt, default=None):
+    suffix = f" [{default}]" if default else ""
+    val = input(f"{prompt}{suffix}: ").strip()
+    return val or default
+
+def ask_bool(prompt, default=True):
+    suffix = " [Y/n]" if default else " [y/N]"
+    val = input(f"{prompt}{suffix}: ").strip().lower()
+    if not val:
+        return default
+    return val.startswith('y')
+
+def write(path, content, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write(content)
+    os.chmod(path, mode)
+    print(f"  wrote {path}")
+
+def run(cmd, check=True):
+    subprocess.run(cmd, shell=True, check=check)
+
+def check_deps():
+    missing = []
+    for tool in ["fuse2fs", "proot", "qemu-arm-static"]:
+        if not shutil.which(tool):
+            missing.append(tool)
+    if missing:
+        print(f"Error: missing dependencies: {', '.join(missing)}")
+        print(f"Install with: sudo apt install fuse2fs proot qemu-user-static")
+        sys.exit(1)
+
+def get_config(config_file):
+    cfg = dict(DEFAULTS)
+    if config_file:
+        with open(config_file, "rb") as f:
+            cfg.update(tomllib.load(f))
+        if cfg.get("wifi") and "wifi_pass" not in cfg:
+            cfg["wifi_pass"] = getpass.getpass("WiFi password: ")
+        if cfg.get("wifi") and "wifi_ssid" not in cfg:
+            cfg["wifi_ssid"] = ask("WiFi SSID")
+        for user in cfg.get("users", []):
+            if "password" not in user:
+                user["password"] = getpass.getpass(f"Password for {user['name']}: ")
+    else:
+        cfg["hostname"] = ask("Hostname", cfg["hostname"])
+        cfg["eth_dhcp"] = ask_bool("Use DHCP for ethernet?", cfg["eth_dhcp"])
+        if not cfg["eth_dhcp"]:
+            cfg["eth_ip"]      = ask("Ethernet IP",      cfg["eth_ip"])
+            cfg["eth_netmask"] = ask("Ethernet netmask", cfg["eth_netmask"])
+            cfg["eth_gateway"] = ask("Ethernet gateway (blank for none)", cfg["eth_gateway"])
+        cfg["wifi"] = ask_bool("Configure WiFi?", cfg["wifi"])
+        if cfg["wifi"]:
+            cfg["wifi_ssid"]    = ask("WiFi SSID")
+            cfg["wifi_pass"]    = getpass.getpass("WiFi password: ")
+            cfg["wifi_dhcp"]    = ask_bool("Use DHCP for WiFi?", cfg["wifi_dhcp"])
+            if not cfg["wifi_dhcp"]:
+                cfg["wlan0_ip"]     = ask("WiFi IP",      cfg["wlan0_ip"])
+                cfg["wifi_netmask"] = ask("WiFi netmask", cfg["wifi_netmask"])
+                cfg["wifi_gateway"] = ask("WiFi gateway", cfg["wifi_gateway"])
+    return cfg
+
+def eth0_block(cfg):
+    if cfg.get("eth_dhcp", True):
+        return """\
+auto eth0
+allow-hotplug eth0
+iface eth0 inet dhcp
+"""
+    else:
+        lines = [
+            "auto eth0",
+            "allow-hotplug eth0",
+            "iface eth0 inet static",
+            f"    address {cfg['eth_ip']}",
+            f"    netmask {cfg['eth_netmask']}",
+        ]
+        if cfg.get("eth_gateway"):
+            lines.append(f"    gateway {cfg['eth_gateway']}")
+        return "\n".join(lines) + "\n"
+
+def wlan0_block(cfg):
+    if not cfg.get("wifi"):
+        return ""
+    if cfg.get("wifi_dhcp", True):
+        return """\
+auto wlan0
+allow-hotplug wlan0
+iface wlan0 inet dhcp
+    wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf
+"""
+    else:
+        return f"""\
+auto wlan0
+allow-hotplug wlan0
+iface wlan0 inet static
+    address {cfg["wlan0_ip"]}
+    netmask {cfg["wifi_netmask"]}
+    gateway {cfg["wifi_gateway"]}
+    wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf
+"""
+
+def write_configs(r, cfg):
+    write(f"{r}/etc/hostname", cfg["hostname"] + "\n")
+    write(f"{r}/etc/hosts", f"""\
+127.0.0.1   localhost
+127.0.1.1   {cfg["hostname"]}
+::1         localhost ip6-localhost ip6-loopback
+ff02::1     ip6-allnodes
+ff02::2     ip6-allrouters
+""")
+    write(f"{r}/etc/network/interfaces", f"""\
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+{eth0_block(cfg)}
+{wlan0_block(cfg)}""")
+
+    if cfg.get("wifi"):
+        write(f"{r}/etc/wpa_supplicant/wpa_supplicant.conf", f"""\
+ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
+update_config=1
+mac_addr=0
+
+network={{
+    ssid="{cfg["wifi_ssid"]}"
+    psk="{cfg["wifi_pass"]}"
+}}
+""", mode=0o600)
+
+def proot_run(mountpoint, cmd, extra_binds=None):
+    qemu = shutil.which("qemu-arm-static")
+    binds = ["-b /etc/resolv.conf"]
+    if extra_binds:
+        binds += [f"-b {b}" for b in extra_binds]
+    binds_str = " ".join(binds)
+    full = (
+        f"proot"
+        f" -q {qemu}"
+        f" -r {mountpoint}"
+        f" -w /"
+        f" {binds_str}"
+        f" {cmd}"
+    )
+    run(full)
+
+def install_packages(mountpoint, packages):
+    if not packages:
+        return
+    print("\nRunning apt-get update...")
+    proot_run(mountpoint, "/usr/bin/apt-get update -qq")
+    pkg_list = " ".join(packages)
+    print(f"Installing packages: {pkg_list}")
+    proot_run(mountpoint, f"/usr/bin/apt-get install -y {pkg_list}")
+
+def create_users(mountpoint, users):
+    if not users:
+        return
+    for user in users:
+        name = user["name"]
+        password = user["password"]
+        sudo = user.get("sudo", False)
+        print(f"\nCreating user: {name} (sudo={sudo})")
+        proot_run(mountpoint, f"/usr/sbin/useradd -m -s /bin/bash {name}")
+        subprocess.run(
+            f"proot -q {shutil.which('qemu-arm-static')} -r {mountpoint} -w / -b /etc/resolv.conf /usr/sbin/chpasswd",
+            input=f"{name}:{password}\n",
+            shell=True, text=True
+        )
+        if sudo:
+            proot_run(mountpoint, f"/usr/sbin/usermod -aG sudo {name}")
+
+def get_partition2_offset(img_path):
+    """Read MBR partition table and return offset+size of partition 2 in bytes."""
+    with open(img_path, 'rb') as f:
+        f.seek(446)  # MBR partition table starts at 446
+        for i in range(4):
+            entry = f.read(16)
+            if i == 1:  # partition 2 (0-indexed)
+                lba_start = struct.unpack_from('<I', entry, 8)[0]
+                lba_size  = struct.unpack_from('<I', entry, 12)[0]
+                return lba_start * 512, lba_size * 512
+    raise RuntimeError("Could not find partition 2 in image")
+
+def main():
+    parser = argparse.ArgumentParser(description="Customise a Devuan Pi image.")
+    parser.add_argument("input",  help="Input image or zip file")
+    parser.add_argument("output", help="Output image file")
+    parser.add_argument("--config", metavar="FILE", help="TOML config file")
+    args = parser.parse_args()
+
+    check_deps()
+
+    print("=== Pi image setup ===\n")
+    cfg = get_config(args.config)
+    print()
+
+    workdir = tempfile.mkdtemp(prefix="pi-img-")
+    img_path = os.path.join(workdir, "image.img")
+    mountpoint = os.path.join(workdir, "mnt")
+    os.makedirs(mountpoint)
+
+    def cleanup():
+        run(f"fusermount -u {mountpoint}", check=False)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    atexit.register(cleanup)
+
+    # Extract or copy input image
+    if args.input.endswith(".zip"):
+        print(f"Extracting {args.input} ...")
+        with zipfile.ZipFile(args.input) as z:
+            imgs = [n for n in z.namelist() if n.endswith(".img")]
+            if not imgs:
+                print("Error: no .img file found in zip"); sys.exit(1)
+            print(f"  found {imgs[0]}")
+            with z.open(imgs[0]) as src, open(img_path, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+    else:
+        print(f"Copying {args.input} ...")
+        shutil.copy2(args.input, img_path)
+
+    # Find partition 2 offset
+    offset, size = get_partition2_offset(img_path)
+    print(f"Partition 2: offset={offset}, size={size}")
+
+    # Mount partition 2 via fuse2fs (no root needed on image file)
+    print(f"Mounting partition 2 -> {mountpoint} ...")
+    run(f"fuse2fs {img_path} {mountpoint} -o fakeroot,no_journal,offset={offset}")
+
+    print("\nWriting config files...")
+    write_configs(mountpoint, cfg)
+    install_packages(mountpoint, cfg.get("packages", []))
+    create_users(mountpoint, cfg.get("users", []))
+
+    print(f"\nUnmounting...")
+    run(f"fusermount -u {mountpoint}")
+
+    # Copy to output
+    print(f"Writing output image: {args.output} ...")
+    shutil.copy2(img_path, args.output)
+
+    print("\n=== Done! ===")
+    print(f"Flash with: dd if={args.output} of=/dev/sdX bs=4M status=progress && sync")
+
+if __name__ == "__main__":
+    main()
