@@ -1,7 +1,9 @@
 # setup-pi
-Tweak the operating system ready or copying it over to an sd card for a raspberry pi. Only works with linux
+Tweak the operating system ready for copying it over to an sd card for a raspberry pi. Only works with linux
 
 Uses mounts, docker, chroot and qemu emulation to tweak your raspberry pi OS producing an image.
+
+AI-generated and unreviewed. However... I have used to the create five pi images.
 
 ## Motivation
 I got bored with mounting and settng up a device to get networking via rj-45 working after I had to upgrade a PI.  So I decided to automate parts of this.
@@ -67,7 +69,7 @@ mode = "0755"
 
 Then run:
 
-setup-raspios intial.img output.img --config config.toml
+`setup-raspios intial.img output.img --config config.toml`
 
 
 
