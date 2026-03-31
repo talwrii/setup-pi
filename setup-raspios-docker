@@ -196,12 +196,13 @@ def write_ssh_keys(name, keys):
     print(f"  wrote {auth_file} ({len(keys)} key(s))")
 
 def main():
-    raw      = sys.stdin.read()
-    tasks    = json.loads(raw)
-    packages = tasks.get("packages", [])
-    users    = tasks.get("users", [])
-    files    = tasks.get("files", [])
-    cfg      = tasks.get("config", {})
+    raw         = sys.stdin.read()
+    tasks       = json.loads(raw)
+    packages    = tasks.get("packages", [])
+    chroot_cmds = tasks.get("chroot_cmds", [])
+    users       = tasks.get("users", [])
+    files       = tasks.get("files", [])
+    cfg         = tasks.get("config", {})
 
     safe = dict(tasks)
     safe["users"] = [{**u, "password": "***"} for u in users]
@@ -231,6 +232,11 @@ def main():
             print(f"\n=== Installing packages: {' '.join(packages)} ===", flush=True)
             chroot_run("apt-get update")
             chroot_run(f"DEBIAN_FRONTEND=noninteractive apt-get install -y {' '.join(packages)}")
+
+        if chroot_cmds:
+            print(f"\n=== Running {len(chroot_cmds)} chroot command(s) ===", flush=True)
+            for cmd in chroot_cmds:
+                chroot_run(cmd)
 
         if cfg.get("first_boot_cmd"):
             print("\n=== Installing first boot script ===", flush=True)

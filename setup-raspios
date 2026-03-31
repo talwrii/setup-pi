@@ -45,6 +45,8 @@ DEFAULTS = {
     "first_boot_cmd":     None,
     # packages to install via chroot
     "packages":           [],
+    # extra commands to run inside the chroot during build
+    "chroot_cmds":        [],
     # users to create
     "users":              [],
     # files to copy into the image
@@ -209,7 +211,7 @@ def run_tasks(mountpoint, cfg, config_dir=None):
     # Only include wifi detail keys if wifi is enabled AND they were explicitly set in TOML
     wifi_detail_keys = {"wifi_dhcp", "wlan0_ip", "wifi_netmask", "wifi_gateway"}
     explicit = cfg.get("_explicit", None)
-    config = {k: v for k, v in cfg.items() if k not in ("packages", "users", "files", "_explicit")}
+    config = {k: v for k, v in cfg.items() if k not in ("packages", "chroot_cmds", "users", "files", "_explicit")}
     if not config.get("wifi"):
         wifi_all = wifi_detail_keys | {"wifi_ssid", "wifi_pass"}
         config = {k: v for k, v in config.items() if k not in wifi_all}
@@ -220,10 +222,11 @@ def run_tasks(mountpoint, cfg, config_dir=None):
     resolved_files = resolve_files(cfg.get("files", []), config_dir=config_dir)
 
     tasks = {
-        "packages": cfg.get("packages", []),
-        "users":    cfg.get("users", []),
-        "files":    resolved_files,
-        "config":   config,
+        "packages":    cfg.get("packages", []),
+        "chroot_cmds": cfg.get("chroot_cmds", []),
+        "users":       cfg.get("users", []),
+        "files":       resolved_files,
+        "config":      config,
     }
     tasks_json = json.dumps(tasks)
     docker_cmd = (
