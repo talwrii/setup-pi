@@ -3,5 +3,6 @@ dist
 __pycache__
 token
 *.toml
+!pyproject.toml
 images
 sudoers
