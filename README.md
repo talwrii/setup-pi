@@ -1,7 +1,7 @@
 # setup-pi
-Tweak the operating system ready or copying it over to an sd card for a raspberry pi
+Tweak the operating system ready or copying it over to an sd card for a raspberry pi. Only works with linux
 
-Uses mounts and chroot to tweak your raspberry pi OS.
+Uses mounts, docker, chroot and qemu emulation to tweak your raspberry pi OS producing an image.
 
 ## Motivation
 I got bored with mounting and settng up a device to get networking via rj-45 working after I had to upgrade a PI.  So I decided to automate parts of this.
@@ -9,19 +9,20 @@ I got bored with mounting and settng up a device to get networking via rj-45 wor
 Part of my motivation was a particularly nasty issue where the Pi would die immeidatley ater boot producing no logs with a certain wifi adaptor. The response from r/raspberrypi on reddit was of course "this is off topic and documented", it was not oftopic or documented.
 
 ## Alternatives and prior work
-Raspios has an image builder.
-
-
-
-
+Raspios has an image builder. An LLM tells me that this works with a first bookt script. I do not like first book scripts because it can be difficult to debug (you need to reflash, insert into a pi, reboot, wait long enough for a boot, switch off the pi, remove the sd card, then mount)
 
 
 ## Installation
-pipx install setup-pi
+Install qemu and docker. Then install
 
+```
+pipx install setup-pi
+```
 
 ## Usage
 Create a toml file describing the image you want to generator.
+
+You can use --sudoers to generate a sudoers rules to run without root.
 
 ```
 hostname  = "electric-pi"
@@ -64,7 +65,9 @@ mode = "0755"
 # password = "letmein"
 ```
 
-./setup-raspios intial.img output.img --config config.toml
+Then run:
+
+setup-raspios intial.img output.img --config config.toml
 
 
 

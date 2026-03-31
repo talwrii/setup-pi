@@ -1,4 +1,4 @@
-*.toml
-listen
-sudoers
-images
+*.egg-info
+dist
+__pycache__
+token

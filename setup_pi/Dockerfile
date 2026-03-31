@@ -7,6 +7,6 @@ RUN apt-get update && apt-get install -y \
     iputils-ping \
     curl \
     && rm -rf /var/lib/apt/lists/*
-COPY setup-raspios-docker /usr/local/bin/setup-raspios-docker
+COPY raspios_docker.py /usr/local/bin/setup-raspios-docker
 RUN chmod +x /usr/local/bin/setup-raspios-docker
 ENTRYPOINT ["/usr/local/bin/setup-raspios-docker"]

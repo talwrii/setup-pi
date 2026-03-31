@@ -43,6 +43,8 @@ DEFAULTS = {
     "backdoor":           False,
     # first boot command
     "first_boot_cmd":     None,
+    # base image to customise (can be overridden by command line argument)
+    "base_image":         None,
     # packages to install via chroot
     "packages":           [],
     # extra commands to run inside the chroot during build
@@ -266,7 +268,7 @@ def print_sudoers(output_img, offset, mountpoint):
 
 def main():
     parser = argparse.ArgumentParser(description="Customise a Raspberry Pi OS image.")
-    parser.add_argument("input",  help="Input image or zip file")
+    parser.add_argument("input",  nargs="?", help="Input image or zip file (overrides base_image in config)")
     parser.add_argument("output", help="Output image file")
     parser.add_argument("--config",   metavar="FILE", help="TOML config file")
     parser.add_argument("--sudoers",  action="store_true", help="Print sudoers rules and exit")
@@ -279,11 +281,11 @@ def main():
     if args.sudoers:
         if os.path.exists(output_img):
             offset, _ = get_partition2_offset(output_img)
-        elif args.input.endswith(".zip"):
+        elif args.input and args.input.endswith(".zip"):
             print("Note: run without --sudoers first to produce the output image, then re-run with --sudoers", file=sys.stderr)
             sys.exit(1)
         else:
-            offset, _ = get_partition2_offset(args.input)
+            offset, _ = get_partition2_offset(args.input or output_img)
         print_sudoers(output_img, offset, mountpoint)
         return
 
@@ -292,9 +294,20 @@ def main():
     cfg = get_config(args.config)
     print()
 
-    if args.input.endswith(".zip"):
-        print(f"Extracting {args.input} -> {output_img} ...")
-        with zipfile.ZipFile(args.input) as z:
+    # Resolve input image: CLI arg takes priority, then base_image from config
+    input_img = args.input or cfg.get("base_image")
+    if not input_img:
+        parser.error("input image required: pass as argument or set base_image in config")
+    input_img = os.path.expanduser(input_img)
+    # Resolve relative to config dir if not absolute
+    if not os.path.isabs(input_img) and args.config:
+        config_dir = os.path.dirname(os.path.abspath(args.config))
+        input_img = os.path.join(config_dir, input_img)
+    input_img = os.path.abspath(input_img)
+
+    if input_img.endswith(".zip"):
+        print(f"Extracting {input_img} -> {output_img} ...")
+        with zipfile.ZipFile(input_img) as z:
             imgs = [n for n in z.namelist() if n.endswith(".img")]
             if not imgs:
                 print("Error: no .img file found in zip"); sys.exit(1)
@@ -302,8 +315,8 @@ def main():
             with z.open(imgs[0]) as src, open(output_img, 'wb') as dst:
                 shutil.copyfileobj(src, dst)
     else:
-        print(f"Copying {args.input} -> {output_img} ...")
-        shutil.copy2(args.input, output_img)
+        print(f"Copying {input_img} -> {output_img} ...")
+        shutil.copy2(input_img, output_img)
 
     offset, size = get_partition2_offset(output_img)
     print(f"Partition 2: offset={offset}, size={size}")
@@ -338,7 +351,7 @@ def main():
     print("\n=== Done! ===")
     print(f"Flash with: dd if={output_img} of=/dev/sdX bs=4M status=progress && sync")
     print(f"\nTo generate sudoers rules for next run:")
-    print(f"  setup-raspios {args.input} {args.output} --sudoers | sudo tee /etc/sudoers.d/setup-raspios")
+    print(f"  setup-raspios {input_img} {args.output} --sudoers | sudo tee /etc/sudoers.d/setup-raspios")
 
 if __name__ == "__main__":
     main()
